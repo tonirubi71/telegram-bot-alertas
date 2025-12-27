@@ -1,39 +1,25 @@
 import os
-import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import asyncio
+from telegram import Bot
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("✅ Bot activo. Escribe /estado para ver el estado y /id para ver tu chat_id.")
+async def main():
+    if not TOKEN:
+        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
+    if not CHAT_ID:
+        raise RuntimeError("Falta CHAT_ID")
 
-async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🟢 Estado: OK. (Servidor conectado y bot operativo)")
-
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    user = update.effective_user
-    await update.message.reply_text(
-        f"🆔 chat_id: {chat.id}\n"
-        f"👤 user_id: {user.id}\n"
-        f"💬 tipo: {chat.type}"
+    bot = Bot(token=TOKEN)
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="✅ Bot iniciado correctamente en Railway"
     )
 
-def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
-
-    app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("id", get_id))
-
-    # Long polling (ideal para Railway)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Mantener el proceso vivo
+    while True:
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
