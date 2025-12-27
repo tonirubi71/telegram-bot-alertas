@@ -2,7 +2,7 @@ import os
 import json
 import time
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
 from telegram import Update
@@ -11,31 +11,42 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alertas-bot")
 
+# =====================
+# ENV
+# =====================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Por defecto (Premià de Mar)
+# Defaults (Premià de Mar)
 DEFAULT_CITY_NAME = os.getenv("DEFAULT_CITY_NAME", "Premià de Mar").strip()
 DEFAULT_LAT = os.getenv("DEFAULT_LAT", "41.491").strip()
 DEFAULT_LON = os.getenv("DEFAULT_LON", "2.365").strip()
 DEFAULT_TZ = os.getenv("WEATHER_TIMEZONE", "Europe/Madrid").strip()
 
-# Alertas meteo
+# Alertas meteo (modo estricto automático)
 WEATHER_CHECK_MINUTES = int(os.getenv("WEATHER_CHECK_MINUTES", "15").strip())
 WEATHER_WIND_GUST_KMH = float(os.getenv("WEATHER_WIND_GUST_KMH", "60").strip())
 WEATHER_RAIN_MM_H = float(os.getenv("WEATHER_RAIN_MM_H", "5").strip())
 WEATHER_RAIN_PROB_PCT = float(os.getenv("WEATHER_RAIN_PROB_PCT", "80").strip())
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "60").strip())
 
+# Nominatim
 NOMINATIM_USER_AGENT = os.getenv("NOMINATIM_USER_AGENT", "").strip()
 
+# Preferencias (simple; puede perderse si hay redeploy/restart)
 PREFS_FILE = "prefs.json"
 
+# Rate limit para Nominatim (máx 1 req/s recomendado)
 _last_nominatim_ts = 0.0
+
+# Anti-spam (solo para alertas automáticas estrictas)
 _last_alert_ts = 0.0
 _last_alert_signature = None
 
 
+# =====================
+# Helpers: env / prefs
+# =====================
 def must_env():
     if not TOKEN:
         raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
@@ -73,6 +84,9 @@ def set_active_location(chat_id: int, lat: str, lon: str, label: str) -> None:
     save_prefs(prefs)
 
 
+# =====================
+# Nominatim (OSM)
+# =====================
 def _rate_limit_nominatim():
     global _last_nominatim_ts
     now = time.time()
@@ -83,7 +97,12 @@ def _rate_limit_nominatim():
 
 
 def nominatim_search(query: str, countrycodes: str = "es") -> Optional[Dict[str, Any]]:
+    """
+    /search: q, format=json, limit=1, addressdetails=1, countrycodes=...
+    Requiere User-Agent identificable y evitar exceso de peticiones.
+    """
     _rate_limit_nominatim()
+
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "q": query,
@@ -99,11 +118,13 @@ def nominatim_search(query: str, countrycodes: str = "es") -> Optional[Dict[str,
     return data[0] if data else None
 
 
+# =====================
+# Open-Meteo
+# =====================
 def open_meteo_hourly(lat: str, lon: str, tz: str) -> Dict[str, Any]:
     """
-    Pedimos:
-    - current: racha de viento, precipitación actual
-    - hourly: precipitación y probabilidad por hora, rachas de viento por hora
+    current: temp, rachas, precip actual
+    hourly: precip, prob precip, rachas
     """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -121,7 +142,7 @@ def open_meteo_hourly(lat: str, lon: str, tz: str) -> Dict[str, Any]:
 
 
 def build_time_text(city: str, data: dict) -> str:
-    cur = data.get("current", {})
+    cur = data.get("current", {}) or {}
     temp = cur.get("temperature_2m")
     gust = cur.get("wind_gusts_10m")
     rain = cur.get("precipitation")
@@ -134,12 +155,24 @@ def build_time_text(city: str, data: dict) -> str:
     )
 
 
-def compute_weather_alert(city: str, data: dict) -> Optional[Tuple[str, str]]:
+def _max_first_n(values: List[Any], n: int) -> float:
+    mx = 0.0
+    for x in values[:n]:
+        if x is None:
+            continue
+        try:
+            mx = max(mx, float(x))
+        except Exception:
+            continue
+    return mx
+
+
+def compute_weather_alert(city: str, data: dict, *, gust_kmh: float, rain_prob_pct: float, rain_mm_h: float, label: str) -> Optional[Tuple[str, str]]:
     """
-    Genera alerta si:
-    - racha actual >= umbral
-    - en próximas 6h: precipitación >= umbral mm/h
-    - en próximas 6h: prob lluvia >= umbral
+    Genera alerta si (mirando ahora + próximas 6 horas):
+      - racha >= gust_kmh
+      - prob lluvia >= rain_prob_pct
+      - precip >= rain_mm_h (mm/h)
     Devuelve (signature, message) o None.
     """
     cur = data.get("current", {}) or {}
@@ -147,64 +180,65 @@ def compute_weather_alert(city: str, data: dict) -> Optional[Tuple[str, str]]:
     rain_now = cur.get("precipitation")
 
     hourly = data.get("hourly", {}) or {}
-    times = hourly.get("time", []) or []
-    pr = hourly.get("precipitation", []) or []
     pp = hourly.get("precipitation_probability", []) or []
+    pr = hourly.get("precipitation", []) or []
     gusts = hourly.get("wind_gusts_10m", []) or []
 
-    # Ventana próximas 6h
-    max_pp = 0.0
-    max_pr = 0.0
-    max_gust = 0.0
-    for i in range(min(len(times), 24)):
-        # tomamos 6 primeras horas a partir del índice 0 (Open-Meteo devuelve desde hoy 00:00 local;
-        # es suficiente para alertas simples, y evita líos con parseo de fechas)
-        if i >= 6:
-            break
-        if i < len(pp) and pp[i] is not None:
-            max_pp = max(max_pp, float(pp[i]))
-        if i < len(pr) and pr[i] is not None:
-            max_pr = max(max_pr, float(pr[i]))
-        if i < len(gusts) and gusts[i] is not None:
-            max_gust = max(max_gust, float(gusts[i]))
+    # Próximas 6h (simple)
+    max_pp = _max_first_n(pp, 6)
+    max_pr = _max_first_n(pr, 6)
+    max_gust = _max_first_n(gusts, 6)
 
     reasons = []
 
+    # Ahora (racha)
     try:
-        if gust_now is not None and float(gust_now) >= WEATHER_WIND_GUST_KMH:
+        if gust_now is not None and float(gust_now) >= gust_kmh:
             reasons.append(f"💨 Rachas fuertes ahora ({float(gust_now):.0f} km/h)")
     except Exception:
         pass
 
-    if max_gust >= WEATHER_WIND_GUST_KMH:
+    # Próximas horas
+    if max_gust >= gust_kmh:
         reasons.append(f"💨 Rachas fuertes próximas horas (máx {max_gust:.0f} km/h)")
 
-    if max_pp >= WEATHER_RAIN_PROB_PCT:
-        reasons.append(f"🌧️ Alta prob. de lluvia (máx {max_pp:.0f}%)")
+    if max_pp >= rain_prob_pct:
+        reasons.append(f"🌧️ Prob. lluvia alta (máx {max_pp:.0f}%)")
 
-    if max_pr >= WEATHER_RAIN_MM_H:
+    if max_pr >= rain_mm_h:
         reasons.append(f"🌧️ Lluvia intensa posible (hasta {max_pr:.1f} mm/h)")
 
     if not reasons:
         return None
 
-    signature = "|".join(reasons)
-    msg = "⚠️ Alerta meteorológica\n" + "\n".join(f"• {r}" for r in reasons) + f"\n\n📍 {city}\nℹ️ Fuente: Open-Meteo"
+    signature = "|".join(reasons) + f"|{label}"
+    msg = (
+        f"⚠️ Alerta meteorológica ({label})\n"
+        + "\n".join(f"• {r}" for r in reasons)
+        + f"\n\n📍 {city}\nℹ️ Fuente: Open-Meteo"
+    )
     return signature, msg
 
 
+# =====================
+# Alertas automáticas (estricto)
+# =====================
 async def maybe_send_weather_alert(app: Application) -> None:
     global _last_alert_ts, _last_alert_signature
 
-    try:
-        chat_id = int(CHAT_ID)
-    except Exception:
-        return
+    chat_id = int(CHAT_ID)
 
-    lat, lon, label = get_active_location(chat_id)
-
+    lat, lon, label_city = get_active_location(chat_id)
     data = open_meteo_hourly(lat, lon, DEFAULT_TZ)
-    alert = compute_weather_alert(label, data)
+
+    alert = compute_weather_alert(
+        label_city,
+        data,
+        gust_kmh=WEATHER_WIND_GUST_KMH,
+        rain_prob_pct=WEATHER_RAIN_PROB_PCT,
+        rain_mm_h=WEATHER_RAIN_MM_H,
+        label="estricto",
+    )
     if not alert:
         return
 
@@ -213,7 +247,7 @@ async def maybe_send_weather_alert(app: Application) -> None:
     now = time.time()
     cooldown_ok = (now - _last_alert_ts) >= (ALERT_COOLDOWN_MIN * 60)
 
-    # Evita spam: si es la misma alerta y aún no pasó cooldown, no enviamos
+    # Anti-spam: si es la misma alerta y aún no pasó cooldown, no enviamos
     if (signature == _last_alert_signature) and (not cooldown_ok):
         return
 
@@ -223,26 +257,26 @@ async def maybe_send_weather_alert(app: Application) -> None:
 
 
 async def weather_loop(app: Application):
-    # mensaje de arranque (una sola vez)
+    # Aviso de arranque (una vez)
     try:
-        await app.bot.send_message(chat_id=int(CHAT_ID), text="✅ Alertas de tiempo activadas.")
+        await app.bot.send_message(chat_id=int(CHAT_ID), text="✅ Alertas de tiempo activadas (modo estricto automático).")
     except Exception:
         pass
 
+    import asyncio
     while True:
         try:
             await maybe_send_weather_alert(app)
         except Exception as e:
             log.exception("Error en weather_loop: %s", e)
-        await asyncio_sleep_minutes(WEATHER_CHECK_MINUTES)
+
+        # dormir
+        await asyncio.sleep(max(60, WEATHER_CHECK_MINUTES * 60))
 
 
-async def asyncio_sleep_minutes(minutes: int):
-    import asyncio
-    await asyncio.sleep(max(60, minutes * 60))
-
-
-# ---- comandos ----
+# =====================
+# Commands
+# =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Bot activo.\n"
@@ -251,7 +285,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /id\n"
         "• /ciudad <nombre>\n"
         "• /tiempo\n"
-        "• /alertas_tiempo (forzar comprobación)"
+        "• /alertas_tiempo (comprobación estricta)\n"
+        "• /alertas_sensible (comprobación puntual sensible)"
     )
 
 
@@ -260,9 +295,10 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🟢 Estado OK.\n"
         f"📍 Ciudad activa: {label}\n"
-        f"🌐 {lat}, {lon}\n"
-        f"⏱️ Revisión: cada {WEATHER_CHECK_MINUTES} min\n"
-        f"Umbrales: racha≥{WEATHER_WIND_GUST_KMH:.0f} km/h | prob lluvia≥{WEATHER_RAIN_PROB_PCT:.0f}% | lluvia≥{WEATHER_RAIN_MM_H:.1f} mm/h"
+        f"🌐 {lat}, {lon}\n\n"
+        f"⏱️ Automático (estricto): cada {WEATHER_CHECK_MINUTES} min\n"
+        f"Umbrales estricto: racha≥{WEATHER_WIND_GUST_KMH:.0f} km/h | prob≥{WEATHER_RAIN_PROB_PCT:.0f}% | lluvia≥{WEATHER_RAIN_MM_H:.1f} mm/h\n"
+        f"Cooldown: {ALERT_COOLDOWN_MIN} min"
     )
 
 
@@ -322,16 +358,51 @@ async def cmd_tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_alertas_tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔔 Comprobando alertas de tiempo…")
+    await update.message.reply_text("🔔 Comprobando alertas (estricto)…")
     try:
         await maybe_send_weather_alert(context.application)
-        await update.message.reply_text("✅ Comprobación hecha. Si había alerta, ya la envié.")
+        await update.message.reply_text("✅ Comprobación hecha. Si había alerta estricta, ya la envié.")
     except Exception:
-        await update.message.reply_text("❌ Error comprobando alertas.")
+        await update.message.reply_text("❌ Error comprobando alertas estrictas.")
 
 
+async def cmd_alertas_sensible(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Solo bajo demanda. No toca el modo automático estricto.
+    Umbrales sensibles:
+      - racha >= 45 km/h
+      - prob lluvia >= 60%
+      - lluvia >= 2 mm/h
+    """
+    await update.message.reply_text("🔔 Comprobando alertas (modo sensible)…")
+    try:
+        chat_id = int(CHAT_ID)
+        lat, lon, label_city = get_active_location(chat_id)
+        data = open_meteo_hourly(lat, lon, DEFAULT_TZ)
+
+        alert = compute_weather_alert(
+            label_city,
+            data,
+            gust_kmh=45.0,
+            rain_prob_pct=60.0,
+            rain_mm_h=2.0,
+            label="sensible",
+        )
+        if alert:
+            _, msg = alert
+            await context.application.bot.send_message(chat_id=chat_id, text=msg)
+        else:
+            await update.message.reply_text("✅ No hay alerta en modo sensible ahora mismo.")
+    except Exception as e:
+        log.exception("Error /alertas_sensible: %s", e)
+        await update.message.reply_text("❌ Error comprobando alertas sensibles.")
+
+
+# =====================
+# PTB lifecycle
+# =====================
 async def post_init(app: Application):
-    # Lanzamos el loop de alertas como tarea de fondo gestionada por PTB
+    # Lanza el loop automático estricto
     app.create_task(weather_loop(app))
 
 
@@ -346,6 +417,7 @@ def main():
     app.add_handler(CommandHandler("ciudad", cmd_ciudad))
     app.add_handler(CommandHandler("tiempo", cmd_tiempo))
     app.add_handler(CommandHandler("alertas_tiempo", cmd_alertas_tiempo))
+    app.add_handler(CommandHandler("alertas_sensible", cmd_alertas_sensible))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
