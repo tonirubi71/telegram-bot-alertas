@@ -2,7 +2,6 @@ import os
 import json
 import time
 import logging
-import re
 import xml.etree.ElementTree as ET
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -25,7 +24,7 @@ DEFAULT_LAT = os.getenv("DEFAULT_LAT", "41.491").strip()
 DEFAULT_LON = os.getenv("DEFAULT_LON", "2.365").strip()
 DEFAULT_TZ = os.getenv("WEATHER_TIMEZONE", "Europe/Madrid").strip()
 
-# Nominatim
+# Nominatim / User-Agent
 NOMINATIM_USER_AGENT = os.getenv("NOMINATIM_USER_AGENT", "").strip()
 
 # Alertas tiempo (estricto automático)
@@ -42,10 +41,10 @@ RODALIES_R1_RSS = os.getenv("RODALIES_R1_RSS", "").strip()
 RODALIES_RG1_RSS = os.getenv("RODALIES_RG1_RSS", "").strip()
 AIR_QUALITY_URL = os.getenv("AIR_QUALITY_URL", "").strip()
 
-# AEMET
-AEMET_ALERTS_RSS = os.getenv("AEMET_ALERTS_RSS", "https://www.aemet.es/en/rss_info/avisos/cat").strip()
+# AEMET RSS (oficial)
+AEMET_ALERTS_RSS = os.getenv("AEMET_ALERTS_RSS", "https://www.aemet.es/es/rss_info/avisos/cat").strip()
 
-# Preferencias (nota: pueden perderse en redeploy; tú elegiste dejarlo así)
+# Preferencias (pueden perderse en redeploy; lo dejamos así como decidiste)
 PREFS_FILE = "prefs.json"
 
 # Rate limit Nominatim
@@ -113,7 +112,6 @@ def _rate_limit_nominatim():
 
 
 def nominatim_search(query: str, countrycodes: str = "es") -> Optional[Dict[str, Any]]:
-    # Política: User-Agent identificable + no más de ~1 req/s. (Cumplimos)  :contentReference[oaicite:5]{index=5}
     _rate_limit_nominatim()
     url = "https://nominatim.openstreetmap.org/search"
     params = {
@@ -130,8 +128,10 @@ def nominatim_search(query: str, countrycodes: str = "es") -> Optional[Dict[str,
     return data[0] if data else None
 
 
+# =====================
+# Open-Meteo
+# =====================
 def open_meteo_hourly(lat: str, lon: str, tz: str) -> Dict[str, Any]:
-    # Docs Open-Meteo: /v1/forecast + variables hourly/current.  :contentReference[oaicite:6]{index=6}
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -215,14 +215,32 @@ def compute_weather_alert(city: str, data: dict, *, gust_kmh: float, rain_prob_p
 # =====================
 # RSS (AEMET / Rodalies)
 # =====================
+def _safe_xml_text(text: str) -> str:
+    """
+    Limpieza básica: BOM/espacios y recorte al primer '<' por si vino basura previa.
+    """
+    if not text:
+        return ""
+    t = text.lstrip("\ufeff").strip()
+    i = t.find("<")
+    return t[i:] if i > 0 else t
+
+
 def parse_rss_items(url: str, limit: int = 5) -> List[Dict[str, str]]:
     """
-    Devuelve lista de items con keys: id,title,link,pubDate/updated
-    Soporta RSS y Atom básico.
+    Descarga RSS/Atom y devuelve items (id,title,link,when).
+    FIX clave: descargamos con User-Agent identificable (AEMET a veces devuelve HTML sin UA).
     """
-    r = requests.get(url, timeout=20)
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}  # reutilizamos UA ya configurado
+    r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
-    xml = r.text.strip()
+
+    xml = _safe_xml_text(r.text)
+
+    # Si nos devolvió HTML, esto te ayuda a detectar el problema en logs
+    if "<html" in xml.lower():
+        raise ValueError(f"Respuesta HTML en vez de XML desde {url} (posible bloqueo/redirect).")
+
     root = ET.fromstring(xml)
 
     items: List[Dict[str, str]] = []
@@ -238,7 +256,7 @@ def parse_rss_items(url: str, limit: int = 5) -> List[Dict[str, str]]:
             items.append({"id": guid, "title": title, "link": link, "when": pub})
         return items
 
-    # Atom (muy simple)
+    # Atom (namespace-aware)
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     entries = root.findall("atom:entry", ns) or root.findall("entry")
     for e in entries[:limit]:
@@ -253,7 +271,6 @@ def parse_rss_items(url: str, limit: int = 5) -> List[Dict[str, str]]:
 
 def looks_serious_train(title: str) -> bool:
     t = (title or "").lower()
-    # Catalán / castellano típicos de incidencias
     keywords = [
         "incid", "avaria", "avería", "suprimit", "suprimido", "cancel",
         "interromp", "interrump", "susp", "retard", "retras", "demora",
@@ -266,16 +283,7 @@ def looks_serious_train(title: str) -> bool:
 # Air quality (genérico)
 # =====================
 def summarize_air_quality(data: Any) -> str:
-    """
-    Como no sabemos el esquema de tu AIR_QUALITY_URL,
-    hacemos un resumen "robusto":
-    - si hay campo tipo 'aqi'/'ica'/'index' en el primer objeto, lo mostramos
-    - si no, mostramos claves principales para confirmar que responde
-    """
-    # Lista de posibles campos comunes
     candidate_fields = ["aqi", "ica", "index", "quality", "qualitat", "value", "valor"]
-
-    # data puede ser dict o list
     if isinstance(data, list) and data:
         obj = data[0]
         if isinstance(obj, dict):
@@ -293,7 +301,6 @@ def summarize_air_quality(data: Any) -> str:
 
 
 def air_signature(data: Any) -> str:
-    # Firma simple para deduplicar (sin depender de esquema)
     try:
         s = json.dumps(data, ensure_ascii=False, sort_keys=True)
         return str(hash(s))
@@ -393,7 +400,6 @@ async def check_trains_and_air(app: Application) -> None:
             now = time.time()
             cooldown_ok = (now - _state["air_last_ts"]) >= (ALERT_COOLDOWN_MIN * 60)
 
-            # Solo avisamos si cambió (firma distinta) y pasó cooldown
             if sig != _state["air_last_sig"] and cooldown_ok:
                 _state["air_last_sig"] = sig
                 _state["air_last_ts"] = now
@@ -415,30 +421,27 @@ async def trains_air_loop(app: Application):
 
 async def check_aemet(app: Application) -> None:
     """
-    AEMET avisos RSS (Catalunya). Enviamos si hay item nuevo.
-    RSS oficial: https://www.aemet.es/en/rss_info/avisos/cat  :contentReference[oaicite:7]{index=7}
+    AEMET avisos RSS. AEMET ofrece canales RSS/ATOM de avisos (oficial). :contentReference[oaicite:2]{index=2}
     """
     chat_id = int(CHAT_ID)
-    try:
-        items = parse_rss_items(AEMET_ALERTS_RSS, limit=1)
-        if not items:
-            return
-        it = items[0]
-        if it["id"] == _state["aemet_last_id"]:
-            return
-        _state["aemet_last_id"] = it["id"]
+    items = parse_rss_items(AEMET_ALERTS_RSS, limit=1)
+    if not items:
+        return
 
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ AEMET — Aviso (Catalunya)\n"
-                f"• {it['title']}\n"
-                f"{it['when']}\n"
-                f"{it['link']}".strip()
-            )
+    it = items[0]
+    if it["id"] == _state["aemet_last_id"]:
+        return
+    _state["aemet_last_id"] = it["id"]
+
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⚠️ AEMET — Aviso (RSS)\n"
+            f"• {it['title']}\n"
+            f"{it['when']}\n"
+            f"{it['link']}".strip()
         )
-    except Exception as e:
-        log.exception("AEMET check error: %s", e)
+    )
 
 
 async def aemet_loop(app: Application):
@@ -487,6 +490,7 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️ Tiempo: cada {WEATHER_CHECK_MINUTES} min (auto estricto)\n"
         f"⏱️ Trenes/Aire: cada {TRAIN_AIR_CHECK_MINUTES} min\n"
         f"⏱️ AEMET: cada 15 min\n"
+        f"AEMET RSS: {AEMET_ALERTS_RSS}\n"
         f"Umbrales estricto: racha≥{WEATHER_WIND_GUST_KMH:.0f} | prob≥{WEATHER_RAIN_PROB_PCT:.0f}% | lluvia≥{WEATHER_RAIN_MM_H:.1f} mm/h"
     )
 
@@ -633,12 +637,12 @@ async def cmd_aemet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             await update.message.reply_text("⚠️ AEMET: no hay items en el RSS ahora.")
             return
-        lines = ["⚠️ AEMET — Avisos Catalunya (últimos)"]
+        lines = ["⚠️ AEMET — Avisos (RSS)"]
         for it in items:
             lines.append(f"• {it['title']}\n{it['link']}".strip())
-        lines.append("\nPágina oficial avisos: https://www.aemet.es/ca/eltiempo/prediccion/avisos?k=cat")
         await update.message.reply_text("\n\n".join(lines))
-    except Exception:
+    except Exception as e:
+        log.exception("AEMET read error: %s", e)
         await update.message.reply_text("❌ No he podido leer el RSS de AEMET ahora mismo.")
 
 
@@ -653,14 +657,12 @@ async def cmd_alertas_aemet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lat, lon, label = get_active_location(update.effective_chat.id)
-    # Enlace rápido (sin API) a OSM y Google Maps
     osm = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=13/{lat}/{lon}"
     gmaps = f"https://www.google.com/maps?q={lat},{lon}"
     await update.message.reply_text(
         f"🗺️ Mapa — {label}\n"
         f"• OpenStreetMap: {osm}\n"
-        f"• Google Maps: {gmaps}\n"
-        f"\n(Si quieres, puedo hacer que además envíe el pin como ubicación.)"
+        f"• Google Maps: {gmaps}"
     )
 
 
@@ -668,12 +670,9 @@ async def cmd_mapa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Lifecycle
 # =====================
 async def post_init(app: Application):
-    # Arranque de loops
     app.create_task(weather_loop(app))
     app.create_task(trains_air_loop(app))
     app.create_task(aemet_loop(app))
-
-    # Ping de arranque
     try:
         await app.bot.send_message(chat_id=int(CHAT_ID), text="✅ Bot reiniciado y operativo (clima + trenes + aire + AEMET).")
     except Exception:
@@ -682,7 +681,6 @@ async def post_init(app: Application):
 
 def main():
     must_env()
-
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
